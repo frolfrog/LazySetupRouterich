@@ -196,9 +196,9 @@ if [ "$AWG_VER" = "2.0" ]; then
     NEED_INSTALL=1
 else
     NEED_INSTALL=0
-    opkg list-installed 2>/dev/null | grep -q "kmod-amneziawg"      || NEED_INSTALL=1
-    opkg list-installed 2>/dev/null | grep -q "amneziawg-tools"      || NEED_INSTALL=1
-    opkg list-installed 2>/dev/null | grep -q "luci-proto-amneziawg" || NEED_INSTALL=1
+    opkg list-installed 2>/dev/null | grep -q "kmod-amneziawg"              || NEED_INSTALL=1
+    opkg list-installed 2>/dev/null | grep -q "amneziawg-tools"              || NEED_INSTALL=1
+    opkg list-installed 2>/dev/null | grep -qE "luci-(app|proto)-amneziawg" || NEED_INSTALL=1
     [ "$NEED_INSTALL" = "0" ] && log_info "Все пакеты AWG уже установлены, пропускаю"
 fi
 
@@ -218,10 +218,12 @@ if [ "$NEED_INSTALL" = "1" ]; then
     rm -f /tmp/amneziawg-install.sh
 
     # Проверяем что все три пакета установились
+    # luci-пакет может называться luci-app-amneziawg или luci-proto-amneziawg
+    # в зависимости от версии прошивки и сборки
     MISSING=""
-    opkg list-installed 2>/dev/null | grep -q "kmod-amneziawg"      || MISSING="$MISSING kmod-amneziawg"
-    opkg list-installed 2>/dev/null | grep -q "amneziawg-tools"      || MISSING="$MISSING amneziawg-tools"
-    opkg list-installed 2>/dev/null | grep -q "luci-proto-amneziawg" || MISSING="$MISSING luci-proto-amneziawg"
+    opkg list-installed 2>/dev/null | grep -q "kmod-amneziawg"  || MISSING="$MISSING kmod-amneziawg"
+    opkg list-installed 2>/dev/null | grep -q "amneziawg-tools"  || MISSING="$MISSING amneziawg-tools"
+    opkg list-installed 2>/dev/null | grep -qE "luci-(app|proto)-amneziawg" || MISSING="$MISSING luci-*-amneziawg"
 
     if [ -n "$MISSING" ]; then
         log_error "Не установились пакеты:$MISSING"
