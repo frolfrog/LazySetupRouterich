@@ -7,23 +7,25 @@
 #   sh /tmp/setup.sh /tmp/vpn.conf
 #
 # Что делает скрипт:
-#   1. Устанавливает пакеты AmneziaWG 2.0 (kmod + tools + luci-proto)
-#   2. Создаёт UCI-интерфейс awg1
-#   3. Настраивает зону файрвола (IPv4)
-#   4. Добавляет NTP-сервер
-#   5. Устанавливает podkop (маршрутизация и DNS)
+#   1. Проверяет совместимость (версия OpenWrt, IPv4 endpoint)
+#   2. Устанавливает пакеты AmneziaWG 2.0 (kmod + tools + luci-proto)
+#      При AWG 2.0 — форсирует переустановку для гарантии свежих пакетов
+#   3. Создаёт UCI-интерфейс awg1
+#   4. Опционально настраивает зону файрвола
+#   5. Добавляет NTP-сервер
+#   6. Устанавливает podkop (маршрутизация и DNS)
 #
 # Требования:
-#   OpenWrt >= 24.10.3 (для AWG 2.0)
+#   OpenWrt >= 24.10.3 (для AWG 2.0 пакетов)
 #   Платформа: mediatek/filogic (RouteRich AX3000)
 #   ~20MB свободного места (sing-box / podkop)
+#   IPv4 endpoint (IPv6 endpoint не поддерживается)
 #
 # Примечания:
-#   - IPv6 не настраивается (инфраструктура IPv4-only)
 #   - После скрипта трафик через туннель не пойдёт сам по себе —
 #     нужно настроить podkop через LuCI: Services → Podkop
-#   - Если провайдер блокирует высокие UDP-порты, порт на сервере
-#     нужно менять там (docker-compose на VPS), а не в конфиге клиента
+#   - Если провайдер блокирует высокие UDP-порты — менять порт
+#     нужно на сервере (docker-compose на VPS), не в конфиге клиента
 # =============================================================================
 
 GREEN='\033[0;32m'
@@ -64,9 +66,8 @@ log_info "Читаю конфиг: $CONF_FILE"
 # =============================================================================
 # Парсинг конфига
 #
-# Простые однословные значения: awk '{print $3}'
-# Многословные значения (I1-I5 — бинарные блобы вида "<b 0x...>"):
-#   sed берёт всё после "FieldName = "
+# parse_simple — для однословных значений (ключи, числа, IP)
+# parse_full   — для многословных значений (I1-I5: бинарные блобы вида <b 0x...>)
 # =============================================================================
 parse_simple() { grep -i "^${1}\b" "$CONF_FILE" | awk '{print $3}'; }
 parse_full()   { grep -i "^${1}\b" "$CONF_FILE" | sed "s/^[^=]*= *//"; }
@@ -89,7 +90,6 @@ H2=$(parse_simple "H2")
 H3=$(parse_simple "H3")
 H4=$(parse_simple "H4")
 
-# AWG 2.0: S3/S4 — простые числа, I1-I5 — могут быть бинарными блобами
 S3=$(parse_simple "S3")
 S4=$(parse_simple "S4")
 I1=$(parse_full "I1")
@@ -112,18 +112,50 @@ else
     AWG_VER="1.0"
 fi
 
-ENDPOINT_HOST=$(echo "$ENDPOINT" | cut -d: -f1)
-ENDPOINT_PORT=$(echo "$ENDPOINT" | cut -d: -f2)
-TUNNEL_IP=$(echo "$ADDRESS" | cut -d/ -f1)
+# =============================================================================
+# РАННЯЯ ВАЛИДАЦИЯ — до любых изменений системы
+# =============================================================================
 
-AWG_IFACE="awg1"
-NTP_SERVER="194.190.168.1"
-
-# Версия OpenWrt
+# 1. Проверка версии OpenWrt (нужна >= 24.10.3 для AWG 2.0 пакетов)
 OPENWRT_VERSION=$(ubus call system board 2>/dev/null | jsonfilter -e '@.release.version' 2>/dev/null)
 if [ -z "$OPENWRT_VERSION" ]; then
     OPENWRT_VERSION=$(grep "DISTRIB_RELEASE=" /etc/openwrt_release | cut -d"'" -f2 | cut -d'.' -f1-3)
 fi
+
+if [ "$AWG_VER" = "2.0" ]; then
+    MAJOR=$(echo "$OPENWRT_VERSION" | cut -d'.' -f1)
+    MINOR=$(echo "$OPENWRT_VERSION" | cut -d'.' -f2)
+    PATCH=$(echo "$OPENWRT_VERSION" | cut -d'.' -f3)
+    OK=0
+    [ "$MAJOR" -gt 24 ] && OK=1
+    [ "$MAJOR" -eq 24 ] && [ "$MINOR" -gt 10 ] && OK=1
+    [ "$MAJOR" -eq 24 ] && [ "$MINOR" -eq 10 ] && [ "$PATCH" -ge 3 ] && OK=1
+    [ "$MAJOR" -eq 23 ] && [ "$MINOR" -eq 5 ]  && [ "$PATCH" -ge 6 ] && OK=1
+    if [ "$OK" = "0" ]; then
+        log_error "AWG 2.0 требует OpenWrt >= 24.10.3, у вас: $OPENWRT_VERSION"
+        log_error "Обновите прошивку или используйте AWG 1.0 конфиг"
+        exit 1
+    fi
+fi
+
+# 2. Проверка endpoint — IPv6 не поддерживается (парсинг через cut -d:)
+if echo "$ENDPOINT" | grep -q "^\["; then
+    log_error "IPv6 endpoint не поддерживается: $ENDPOINT"
+    log_error "Используйте IPv4 адрес или hostname в Endpoint"
+    exit 1
+fi
+
+ENDPOINT_HOST=$(echo "$ENDPOINT" | cut -d: -f1)
+ENDPOINT_PORT=$(echo "$ENDPOINT" | cut -d: -f2)
+
+if [ -z "$ENDPOINT_HOST" ] || [ -z "$ENDPOINT_PORT" ]; then
+    log_error "Некорректный формат Endpoint: $ENDPOINT (ожидается host:port)"
+    exit 1
+fi
+
+TUNNEL_IP=$(echo "$ADDRESS" | cut -d/ -f1)
+AWG_IFACE="awg1"
+NTP_SERVER="194.190.168.1"
 
 # =============================================================================
 # Подтверждение параметров
@@ -151,21 +183,27 @@ echo ""
 # =============================================================================
 # ШАГ 1: Установка пакетов AmneziaWG
 #
+# Для AWG 2.0 форсируем переустановку всех трёх пакетов — это гарантирует
+# что luci-proto-amneziawg умеет принимать H1-H4 как строки и I1-I5.
+# Старый пакет может называться правильно, но не поддерживать новый формат.
+#
 # sh <(wget ...) не работает в BusyBox ash — используем временный файл.
-# Скрипт Shchipunov сам определяет платформу и скачивает нужные .ipk
-# из релизов GitHub под mediatek/filogic / aarch64_cortex-a53 / 24.10.x
 # =============================================================================
 log_info "=== ШАГ 1: Установка пакетов AmneziaWG ==="
 
-AWG_NEED_INSTALL=0
-opkg list-installed 2>/dev/null | grep -q "kmod-amneziawg"      || AWG_NEED_INSTALL=1
-opkg list-installed 2>/dev/null | grep -q "amneziawg-tools"      || AWG_NEED_INSTALL=1
-opkg list-installed 2>/dev/null | grep -q "luci-proto-amneziawg" || AWG_NEED_INSTALL=1
-
-if [ "$AWG_NEED_INSTALL" = "0" ]; then
-    log_info "Все пакеты AWG уже установлены, пропускаю"
+if [ "$AWG_VER" = "2.0" ]; then
+    log_info "AWG 2.0: форсирую переустановку пакетов для гарантии совместимости..."
+    NEED_INSTALL=1
 else
-    log_info "Устанавливаю пакеты AWG $AWG_VER..."
+    NEED_INSTALL=0
+    opkg list-installed 2>/dev/null | grep -q "kmod-amneziawg"      || NEED_INSTALL=1
+    opkg list-installed 2>/dev/null | grep -q "amneziawg-tools"      || NEED_INSTALL=1
+    opkg list-installed 2>/dev/null | grep -q "luci-proto-amneziawg" || NEED_INSTALL=1
+    [ "$NEED_INSTALL" = "0" ] && log_info "Все пакеты AWG уже установлены, пропускаю"
+fi
+
+if [ "$NEED_INSTALL" = "1" ]; then
+    log_info "Скачиваю установщик AWG..."
     wget -4 -O /tmp/amneziawg-install.sh \
         https://raw.githubusercontent.com/Slava-Shchipunov/awg-openwrt/refs/heads/master/amneziawg-install.sh
 
@@ -209,20 +247,15 @@ uci set network.$AWG_IFACE.private_key="$PRIVATE_KEY"
 
 # DNS не прописываем — podkop управляет DNS самостоятельно
 
-# Обфускация (awg_* префикс — требование luci-proto-amneziawg)
 [ -n "$JC"   ] && uci set network.$AWG_IFACE.awg_jc="$JC"
 [ -n "$JMIN" ] && uci set network.$AWG_IFACE.awg_jmin="$JMIN"
 [ -n "$JMAX" ] && uci set network.$AWG_IFACE.awg_jmax="$JMAX"
 [ -n "$S1"   ] && uci set network.$AWG_IFACE.awg_s1="$S1"
 [ -n "$S2"   ] && uci set network.$AWG_IFACE.awg_s2="$S2"
-
-# H1-H4: UCI принимает формат "number-number" как обычную строку
 [ -n "$H1"   ] && uci set network.$AWG_IFACE.awg_h1="$H1"
 [ -n "$H2"   ] && uci set network.$AWG_IFACE.awg_h2="$H2"
 [ -n "$H3"   ] && uci set network.$AWG_IFACE.awg_h3="$H3"
 [ -n "$H4"   ] && uci set network.$AWG_IFACE.awg_h4="$H4"
-
-# AWG 2.0 дополнительные поля
 [ -n "$S3"   ] && uci set network.$AWG_IFACE.awg_s3="$S3"
 [ -n "$S4"   ] && uci set network.$AWG_IFACE.awg_s4="$S4"
 [ -n "$I1"   ] && uci set network.$AWG_IFACE.awg_i1="$I1"
@@ -231,7 +264,6 @@ uci set network.$AWG_IFACE.private_key="$PRIVATE_KEY"
 [ -n "$I4"   ] && uci set network.$AWG_IFACE.awg_i4="$I4"
 [ -n "$I5"   ] && uci set network.$AWG_IFACE.awg_i5="$I5"
 
-# Peer
 # route_allowed_ips=0 — маршрутами управляет podkop, не AWG
 uci set network.${AWG_IFACE}_peer=amneziawg_${AWG_IFACE}
 uci set network.${AWG_IFACE}_peer.public_key="$PUBLIC_KEY"
@@ -246,30 +278,56 @@ uci commit network
 log_info "Интерфейс $AWG_IFACE создан"
 
 # =============================================================================
-# ШАГ 3: Файрвол (IPv4)
+# ШАГ 3: Файрвол (опционально)
+#
+# Документация podkop говорит что зона не требуется при использовании podkop.
+# Однако RouteRich может вести себя иначе из-за особенностей прошивки.
+# Предлагаем выбор: создать зону сейчас или пропустить и добавить вручную
+# если туннель не заработает после перезагрузки.
 # =============================================================================
-log_info "=== ШАГ 3: Настройка файрвола ==="
+log_info "=== ШАГ 3: Файрвол ==="
 
-uci delete firewall.awg_zone   2>/dev/null || true
-uci delete firewall.lan_to_awg 2>/dev/null || true
+echo ""
+log_warn "Документация podkop не требует создания firewall-зоны для AWG."
+log_warn "Однако RouteRich может работать иначе."
+echo ""
+printf "Создать firewall-зону для $AWG_IFACE? (y/n) [y]: "
+read -r FW_CONFIRM
+FW_CONFIRM="${FW_CONFIRM:-y}"
 
-uci set firewall.awg_zone=zone
-uci set firewall.awg_zone.name=awg
-uci set firewall.awg_zone.network="$AWG_IFACE"
-uci set firewall.awg_zone.input=REJECT
-uci set firewall.awg_zone.output=ACCEPT
-uci set firewall.awg_zone.forward=REJECT
-uci set firewall.awg_zone.masq=1
-uci set firewall.awg_zone.mtu_fix=1
-uci set firewall.awg_zone.family=ipv4
+if [ "$FW_CONFIRM" = "y" ]; then
+    uci delete firewall.awg_zone   2>/dev/null || true
+    uci delete firewall.lan_to_awg 2>/dev/null || true
 
-uci set firewall.lan_to_awg=forwarding
-uci set firewall.lan_to_awg.src=lan
-uci set firewall.lan_to_awg.dest=awg
-uci set firewall.lan_to_awg.family=ipv4
+    uci set firewall.awg_zone=zone
+    uci set firewall.awg_zone.name=awg
+    uci set firewall.awg_zone.network="$AWG_IFACE"
+    uci set firewall.awg_zone.input=REJECT
+    uci set firewall.awg_zone.output=ACCEPT
+    uci set firewall.awg_zone.forward=REJECT
+    uci set firewall.awg_zone.masq=1
+    uci set firewall.awg_zone.mtu_fix=1
+    uci set firewall.awg_zone.family=ipv4
 
-uci commit firewall
-log_info "Файрвол настроен"
+    uci set firewall.lan_to_awg=forwarding
+    uci set firewall.lan_to_awg.src=lan
+    uci set firewall.lan_to_awg.dest=awg
+    uci set firewall.lan_to_awg.family=ipv4
+
+    uci commit firewall
+    log_info "Firewall-зона создана"
+else
+    log_warn "Зона пропущена. Если туннель не заработает — создайте вручную:"
+    echo "  uci set firewall.awg_zone=zone"
+    echo "  uci set firewall.awg_zone.name=awg"
+    echo "  uci set firewall.awg_zone.network=$AWG_IFACE"
+    echo "  uci set firewall.awg_zone.masq=1"
+    echo "  uci set firewall.awg_zone.mtu_fix=1"
+    echo "  uci set firewall.lan_to_awg=forwarding"
+    echo "  uci set firewall.lan_to_awg.src=lan"
+    echo "  uci set firewall.lan_to_awg.dest=awg"
+    echo "  uci commit firewall && /etc/init.d/firewall reload"
+fi
 
 # =============================================================================
 # ШАГ 4: NTP
