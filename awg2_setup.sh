@@ -3,23 +3,27 @@
 # RouteRich AX3000 (OpenWrt) — AmneziaWG 2.0 + podkop Setup Script
 # =============================================================================
 # Использование:
-#   sh <(wget -O - https://your-host/routerich-awg2-setup.sh) /path/to/vpn.conf
-#
-# Или в два шага:
 #   wget -O /tmp/setup.sh https://your-host/routerich-awg2-setup.sh
 #   sh /tmp/setup.sh /tmp/vpn.conf
 #
 # Что делает скрипт:
-#   1. Устанавливает пакеты AmneziaWG 2.0
+#   1. Устанавливает пакеты AmneziaWG 2.0 (kmod + tools + luci-proto)
 #   2. Создаёт UCI-интерфейс awg1
-#   3. Настраивает зону файрвола
+#   3. Настраивает зону файрвола (IPv4)
 #   4. Добавляет NTP-сервер
-#   5. Устанавливает podkop (маршрутизация)
+#   5. Устанавливает podkop (маршрутизация и DNS)
 #
 # Требования:
 #   OpenWrt >= 24.10.3 (для AWG 2.0)
 #   Платформа: mediatek/filogic (RouteRich AX3000)
-#   Минимум 20MB свободного места (для sing-box / podkop)
+#   ~20MB свободного места (sing-box / podkop)
+#
+# Примечания:
+#   - IPv6 не настраивается (инфраструктура IPv4-only)
+#   - После скрипта трафик через туннель не пойдёт сам по себе —
+#     нужно настроить podkop через LuCI: Services → Podkop
+#   - Если провайдер блокирует высокие UDP-порты, порт на сервере
+#     нужно менять там (docker-compose на VPS), а не в конфиге клиента
 # =============================================================================
 
 GREEN='\033[0;32m'
@@ -45,7 +49,7 @@ CONF_FILE="$1"
 if [ -z "$CONF_FILE" ]; then
     log_error "Укажите путь к конфигу AWG:"
     echo ""
-    echo "  sh setup.sh /path/to/vpn.conf"
+    echo "  sh /tmp/setup.sh /tmp/vpn.conf"
     echo ""
     exit 1
 fi
@@ -59,41 +63,47 @@ log_info "Читаю конфиг: $CONF_FILE"
 
 # =============================================================================
 # Парсинг конфига
-# Поддерживается AWG 1.0 и AWG 2.0 (H1-H4 в формате "number-number")
+#
+# Простые однословные значения: awk '{print $3}'
+# Многословные значения (I1-I5 — бинарные блобы вида "<b 0x...>"):
+#   sed берёт всё после "FieldName = "
 # =============================================================================
-PRIVATE_KEY=$(grep -i   "^PrivateKey"           "$CONF_FILE" | awk '{print $3}')
-ADDRESS=$(grep -i       "^Address"              "$CONF_FILE" | awk '{print $3}')
-DNS=$(grep -i           "^DNS"                  "$CONF_FILE" | awk '{print $3}')
-PUBLIC_KEY=$(grep -i    "^PublicKey"            "$CONF_FILE" | awk '{print $3}')
-PRESHARED_KEY=$(grep -i "^PresharedKey"         "$CONF_FILE" | awk '{print $3}')
-ENDPOINT=$(grep -i      "^Endpoint"             "$CONF_FILE" | awk '{print $3}')
-KEEPALIVE=$(grep -i     "^PersistentKeepalive"  "$CONF_FILE" | awk '{print $3}')
+parse_simple() { grep -i "^${1}\b" "$CONF_FILE" | awk '{print $3}'; }
+parse_full()   { grep -i "^${1}\b" "$CONF_FILE" | sed "s/^[^=]*= *//"; }
 
-JC=$(grep -i   "^Jc\b"   "$CONF_FILE" | awk '{print $3}')
-JMIN=$(grep -i "^Jmin\b" "$CONF_FILE" | awk '{print $3}')
-JMAX=$(grep -i "^Jmax\b" "$CONF_FILE" | awk '{print $3}')
-S1=$(grep -i   "^S1\b"   "$CONF_FILE" | awk '{print $3}')
-S2=$(grep -i   "^S2\b"   "$CONF_FILE" | awk '{print $3}')
-H1=$(grep -i   "^H1\b"   "$CONF_FILE" | awk '{print $3}')
-H2=$(grep -i   "^H2\b"   "$CONF_FILE" | awk '{print $3}')
-H3=$(grep -i   "^H3\b"   "$CONF_FILE" | awk '{print $3}')
-H4=$(grep -i   "^H4\b"   "$CONF_FILE" | awk '{print $3}')
+PRIVATE_KEY=$(parse_simple "PrivateKey")
+ADDRESS=$(parse_simple "Address")
+DNS=$(parse_simple "DNS")
+PUBLIC_KEY=$(parse_simple "PublicKey")
+PRESHARED_KEY=$(parse_simple "PresharedKey")
+ENDPOINT=$(parse_simple "Endpoint")
+KEEPALIVE=$(parse_simple "PersistentKeepalive")
 
-# AWG 2.0 дополнительные поля
-S3=$(grep -i   "^S3\b"   "$CONF_FILE" | awk '{print $3}')
-S4=$(grep -i   "^S4\b"   "$CONF_FILE" | awk '{print $3}')
-I1=$(grep -i   "^I1\b"   "$CONF_FILE" | awk '{print $3}')
-I2=$(grep -i   "^I2\b"   "$CONF_FILE" | awk '{print $3}')
-I3=$(grep -i   "^I3\b"   "$CONF_FILE" | awk '{print $3}')
-I4=$(grep -i   "^I4\b"   "$CONF_FILE" | awk '{print $3}')
-I5=$(grep -i   "^I5\b"   "$CONF_FILE" | awk '{print $3}')
+JC=$(parse_simple "Jc")
+JMIN=$(parse_simple "Jmin")
+JMAX=$(parse_simple "Jmax")
+S1=$(parse_simple "S1")
+S2=$(parse_simple "S2")
+H1=$(parse_simple "H1")
+H2=$(parse_simple "H2")
+H3=$(parse_simple "H3")
+H4=$(parse_simple "H4")
+
+# AWG 2.0: S3/S4 — простые числа, I1-I5 — могут быть бинарными блобами
+S3=$(parse_simple "S3")
+S4=$(parse_simple "S4")
+I1=$(parse_full "I1")
+I2=$(parse_full "I2")
+I3=$(parse_full "I3")
+I4=$(parse_full "I4")
+I5=$(parse_full "I5")
 
 if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ] || [ -z "$ENDPOINT" ]; then
     log_error "Конфиг неполный. Должны быть: PrivateKey, PublicKey, Endpoint"
     exit 1
 fi
 
-# Определяем версию AWG по формату H1 или наличию новых полей
+# Определяем версию AWG по формату H1 или наличию полей AWG 2.0
 if [ -n "$H1" ] && echo "$H1" | grep -q "-"; then
     AWG_VER="2.0"
 elif [ -n "$S3" ] || [ -n "$I1" ]; then
@@ -109,7 +119,7 @@ TUNNEL_IP=$(echo "$ADDRESS" | cut -d/ -f1)
 AWG_IFACE="awg1"
 NTP_SERVER="194.190.168.1"
 
-# Определяем версию OpenWrt
+# Версия OpenWrt
 OPENWRT_VERSION=$(ubus call system board 2>/dev/null | jsonfilter -e '@.release.version' 2>/dev/null)
 if [ -z "$OPENWRT_VERSION" ]; then
     OPENWRT_VERSION=$(grep "DISTRIB_RELEASE=" /etc/openwrt_release | cut -d"'" -f2 | cut -d'.' -f1-3)
@@ -126,11 +136,11 @@ echo "  Интерфейс  : $AWG_IFACE"
 echo "  Endpoint   : $ENDPOINT_HOST:$ENDPOINT_PORT"
 echo "  Tunnel IP  : $TUNNEL_IP"
 echo "  NTP        : $NTP_SERVER"
-echo "  Маршрутиз. : podkop"
+echo "  Маршрутиз. : podkop (настраивается после перезагрузки)"
 [ -n "$JC" ] && echo "  Jc/Jmin/Jmax/S1/S2 : $JC/$JMIN/$JMAX/$S1/$S2"
 [ -n "$H1" ] && echo "  H1-H4      : $H1 / $H2 / $H3 / $H4"
 [ -n "$S3" ] && echo "  S3/S4      : $S3 / $S4"
-[ -n "$I1" ] && echo "  I1-I5      : $I1 / $I2 / $I3 / $I4 / $I5"
+[ -n "$I1" ] && echo "  I1         : $(echo "$I1" | cut -c1-40)..."
 echo ""
 
 printf "Продолжить установку? (y/n): "
@@ -140,23 +150,48 @@ echo ""
 
 # =============================================================================
 # ШАГ 1: Установка пакетов AmneziaWG
+#
+# sh <(wget ...) не работает в BusyBox ash — используем временный файл.
+# Скрипт Shchipunov сам определяет платформу и скачивает нужные .ipk
+# из релизов GitHub под mediatek/filogic / aarch64_cortex-a53 / 24.10.x
 # =============================================================================
 log_info "=== ШАГ 1: Установка пакетов AmneziaWG ==="
 
-if opkg list-installed 2>/dev/null | grep -q "kmod-amneziawg"; then
-    log_info "kmod-amneziawg уже установлен, пропускаю"
+AWG_NEED_INSTALL=0
+opkg list-installed 2>/dev/null | grep -q "kmod-amneziawg"      || AWG_NEED_INSTALL=1
+opkg list-installed 2>/dev/null | grep -q "amneziawg-tools"      || AWG_NEED_INSTALL=1
+opkg list-installed 2>/dev/null | grep -q "luci-proto-amneziawg" || AWG_NEED_INSTALL=1
+
+if [ "$AWG_NEED_INSTALL" = "0" ]; then
+    log_info "Все пакеты AWG уже установлены, пропускаю"
 else
     log_info "Устанавливаю пакеты AWG $AWG_VER..."
-    # Отвечаем "n" на вопрос о языковом пакете и "n" на вопрос о настройке
-    # интерфейса — интерфейс настраиваем сами в шаге 2
-    printf "n\nn\n" | sh <(wget -4 -O - \
-        https://raw.githubusercontent.com/Slava-Shchipunov/awg-openwrt/refs/heads/master/amneziawg-install.sh) \
-        2>&1 | grep -vE "^$" || true
-    log_info "Пакеты AWG установлены"
-fi
+    wget -4 -O /tmp/amneziawg-install.sh \
+        https://raw.githubusercontent.com/Slava-Shchipunov/awg-openwrt/refs/heads/master/amneziawg-install.sh
 
-if ! opkg list-installed 2>/dev/null | grep -q "luci-proto-amneziawg"; then
-    log_warn "luci-proto-amneziawg не найден — возможно OpenWrt < 24.10.3 или установка не удалась"
+    if [ ! -s /tmp/amneziawg-install.sh ]; then
+        log_error "Не удалось скачать amneziawg-install.sh"
+        exit 1
+    fi
+
+    # n — пропустить языковой пакет
+    # n — пропустить настройку интерфейса (делаем сами в шаге 2)
+    printf "n\nn\n" | sh /tmp/amneziawg-install.sh 2>&1 | grep -vE "^$" || true
+    rm -f /tmp/amneziawg-install.sh
+
+    # Проверяем что все три пакета установились
+    MISSING=""
+    opkg list-installed 2>/dev/null | grep -q "kmod-amneziawg"      || MISSING="$MISSING kmod-amneziawg"
+    opkg list-installed 2>/dev/null | grep -q "amneziawg-tools"      || MISSING="$MISSING amneziawg-tools"
+    opkg list-installed 2>/dev/null | grep -q "luci-proto-amneziawg" || MISSING="$MISSING luci-proto-amneziawg"
+
+    if [ -n "$MISSING" ]; then
+        log_error "Не установились пакеты:$MISSING"
+        log_error "Проверьте интернет и версию OpenWrt (нужна >= 24.10.3)"
+        exit 1
+    fi
+
+    log_info "Все пакеты AWG установлены"
 fi
 
 # =============================================================================
@@ -211,8 +246,7 @@ uci commit network
 log_info "Интерфейс $AWG_IFACE создан"
 
 # =============================================================================
-# ШАГ 3: Файрвол
-# Зона нужна для корректной работы podkop с AWG-интерфейсом.
+# ШАГ 3: Файрвол (IPv4)
 # =============================================================================
 log_info "=== ШАГ 3: Настройка файрвола ==="
 
@@ -239,7 +273,6 @@ log_info "Файрвол настроен"
 
 # =============================================================================
 # ШАГ 4: NTP
-# Важно для корректного старта AWG-туннеля после перезагрузки
 # =============================================================================
 log_info "=== ШАГ 4: NTP ==="
 
@@ -249,16 +282,12 @@ log_info "NTP сервер добавлен: $NTP_SERVER"
 
 # =============================================================================
 # ШАГ 5: Установка podkop
-# podkop берёт на себя всю маршрутизацию: обход блокировок по доменам/IP,
-# DNS через туннель для заблокированных ресурсов.
-# После установки настраивается через LuCI: Services → Podkop
 # =============================================================================
 log_info "=== ШАГ 5: Установка podkop ==="
 
 if opkg list-installed 2>/dev/null | grep -q "^podkop "; then
     log_info "podkop уже установлен, пропускаю"
 else
-    # Проверяем свободное место (нужно ~20MB для sing-box)
     FREE_MB=$(df /overlay 2>/dev/null | awk 'NR==2{printf "%d", $4/1024}')
     if [ -n "$FREE_MB" ] && [ "$FREE_MB" -lt 20 ]; then
         log_warn "Мало свободного места: ${FREE_MB}MB (нужно ~20MB для podkop + sing-box)"
@@ -269,22 +298,29 @@ else
     fi
 
     if [ "$PODKOP_CONFIRM" = "y" ]; then
-        log_info "Устанавливаю podkop (~1-2 минуты)..."
-        sh <(wget -O - https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh) \
-            2>&1 | grep -vE "^$" || true
+        log_info "Скачиваю и устанавливаю podkop (~1-2 минуты)..."
+        wget -O /tmp/podkop-install.sh \
+            https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh
 
-        if opkg list-installed 2>/dev/null | grep -q "^podkop "; then
-            log_info "podkop установлен успешно"
+        if [ ! -s /tmp/podkop-install.sh ]; then
+            log_error "Не удалось скачать podkop install.sh"
         else
-            log_warn "podkop не удалось установить — настройте маршрутизацию вручную"
+            sh /tmp/podkop-install.sh 2>&1 | grep -vE "^$" || true
+            rm -f /tmp/podkop-install.sh
+
+            if opkg list-installed 2>/dev/null | grep -q "^podkop "; then
+                log_info "podkop установлен успешно"
+            else
+                log_warn "podkop не удалось установить — настройте маршрутизацию вручную"
+            fi
         fi
     else
-        log_warn "Установка podkop пропущена. Настройте маршрутизацию вручную."
+        log_warn "Установка podkop пропущена."
     fi
 fi
 
 # =============================================================================
-# Применяем сетевые настройки
+# Применяем настройки
 # =============================================================================
 log_info "Применяю настройки сети и файрвола..."
 /etc/init.d/network reload  2>/dev/null || true
@@ -308,10 +344,12 @@ echo ""
 echo "  1. Перезагрузите роутер:"
 echo "     reboot"
 echo ""
-echo "  2. После перезагрузки проверьте туннель:"
+echo "  2. Проверьте туннель (handshake должен быть < 2 минут):"
 echo "     amneziawg show"
 echo ""
 echo "  3. Настройте podkop через LuCI:"
 echo "     Services → Podkop"
 echo "     Tunnel interface: $AWG_IFACE"
+echo ""
+log_warn "  Трафик через туннель не пойдёт без настройки podkop!"
 echo "============================================================"
